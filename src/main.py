@@ -159,7 +159,7 @@ def process_replay(replay_path, output_dir: Path):
     for player in manifest["players"]:
         replay_player = {
             "player_id": player["subject"],
-            "rank": -1,
+            "rank": 0,
         }
 
         rank_row = duckdb.query(
