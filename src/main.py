@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import duckdb
 from pathlib import Path
 
 import boto3
@@ -17,7 +18,7 @@ load_dotenv()
 # Configuration
 # ---------------------------------------------------------------------------
 
-BATCH_SIZE = 25
+BATCH_SIZE = 3
 
 VRFKIT = Path(os.getenv("VRFKIT_PATH", "./vrfkit.exe"))
 
@@ -86,6 +87,7 @@ def get_pending_replays():
         SELECT verified_hash, storage_key
         FROM replays
         WHERE processing_status = 'pending'
+        ORDER BY created_at DESC
         LIMIT ?
         """,
         [BATCH_SIZE],
@@ -110,7 +112,19 @@ def download_replay(storage_key, destination):
 # vrfkit
 # ---------------------------------------------------------------------------
 
-def process_replay(replay_path, output_dir):
+def extract_map_name(path: str) -> str:
+    parts = path.split("/")
+    if len(parts) != 5 or parts[0] != "" or parts[1] != "Game" or parts[2] != "Maps" or parts[3] != parts[4]:
+        raise RuntimeError(f"Invalid map path {path!r}")
+    return parts[-2]
+
+def extract_agent_name(path: str) -> str:
+    parts = path.split("/")
+    if len(parts) != 5 or parts[0] != "" or parts[1] != "Game" or parts[2] != "Characters" or parts[4] != f"{parts[3]}_PC.{parts[3]}_PC_C":
+        raise RuntimeError(f"Invalid agent path {path!r}")
+    return parts[-2]
+
+def process_replay(replay_path, output_dir: Path):
     subprocess.run(
         [
             str(VRFKIT),
@@ -123,44 +137,69 @@ def process_replay(replay_path, output_dir):
     )
 
     manifest_path = output_dir / "manifest.json"
-
     if not manifest_path.exists():
         raise RuntimeError("vrfkit did not produce manifest.json")
 
-    with manifest_path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    with open(manifest_path.as_posix(), "r") as f:
+        manifest = json.load(f)
 
+    if len(manifest["level_names_and_times"]) != 1:
+        raise RuntimeError("Replay has more than 1 map")
 
-# ---------------------------------------------------------------------------
-# Metadata extraction
-# ---------------------------------------------------------------------------
-
-def extract_metadata(manifest):
-    """
-    Adapt this to the actual vrfkit manifest structure.
-
-    Return:
-        replay metadata
-        list of player metadata
-    """
-
-    replay = {
-        "map": manifest.get("map"),
-        "game_version": manifest.get("game_version"),
-        "duration_ms": manifest.get("duration_ms"),
+    metadata = {
+        "map": extract_map_name(manifest["level_names_and_times"][0]["name"]),
+        "duration_ms": manifest["duration_ms"],
+        "game_version": manifest["replay_build"]
     }
 
-    players = []
+    min_player_id = float("inf")
+    max_player_id = float("-inf")
 
-    for player in manifest.get("players", []):
-        players.append({
-            "player_id": player.get("player_id"),
-            "team": player.get("team"),
-            "agent": player.get("agent"),
-            "rank": player.get("rank"),
-        })
+    replay_players = []
+    for player in manifest["players"]:
+        replay_player = {
+            "player_id": player["subject"],
+            "rank": -1,
+        }
 
-    return replay, players
+        rank_row = duckdb.query(
+            "SELECT value_i64 FROM read_parquet(?) WHERE actor_net_guid = ? AND group_path = '/Game/GameModes/Bomb/BombPlayerState.BombPlayerState_C' AND field_name = 'CompetitiveTier'",
+            params=[(output_dir / "fields.parquet").as_posix(), player["actor_net_guid"]],
+        ).fetchone()
+
+        if rank_row is not None:
+            replay_player["rank"] = rank_row[0]
+
+        player_id_row = duckdb.query(
+            "SELECT value_i64 FROM read_parquet(?) WHERE actor_net_guid = ? AND group_path = '/Game/GameModes/Bomb/BombPlayerState.BombPlayerState_C' AND field_name = 'PlayerId'",
+            params=[(output_dir / "fields.parquet").as_posix(), player["actor_net_guid"]],
+        ).fetchone()
+        if player_id_row is None:
+            raise RuntimeError("No player id row found")
+
+        replay_player["game_player_id"] = player_id_row[0]
+        min_player_id = min(min_player_id, player_id_row[0])
+        max_player_id = max(max_player_id, player_id_row[0])
+
+        agent_row = duckdb.query(
+            "SELECT class_path FROM read_parquet(?) WHERE event = 'open' AND actor_net_guid = ? AND class_path LIKE '/Game/Characters/%/%_PC.%_PC_C'",
+            params=[(output_dir / "actors.parquet").as_posix(), player["character_net_guid"]],
+        ).fetchone()
+        if agent_row is None:
+            raise RuntimeError("No agent row found")
+
+        replay_player["agent"] = extract_agent_name(agent_row[0])
+
+        replay_players.append(replay_player)
+
+    if (max_player_id - min_player_id) + 1 != 10:
+        raise RuntimeError("Number of player ids is not 10")
+
+    for player in replay_players:
+        player["team"] = (player["game_player_id"] - min_player_id) // 5
+        del player["game_player_id"]
+
+    return metadata, replay_players
 
 
 # ---------------------------------------------------------------------------
@@ -168,12 +207,6 @@ def extract_metadata(manifest):
 # ---------------------------------------------------------------------------
 
 def save_batch(updates, players):
-    """
-    One D1 request containing all UPDATE/INSERT statements.
-
-    D1's API accepts multiple statements in one request.
-    """
-
     statements = []
 
     for update in updates:
@@ -224,7 +257,7 @@ def save_batch(updates, players):
     response = requests.post(
         D1_URL,
         headers=D1_HEADERS,
-        json=statements,
+        json={"batch": statements},
         timeout=60,
     )
 
