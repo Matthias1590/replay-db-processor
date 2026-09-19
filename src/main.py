@@ -87,7 +87,6 @@ def get_pending_replays():
         SELECT verified_hash, storage_key
         FROM replays
         WHERE processing_status = 'pending'
-        ORDER BY created_at DESC
         LIMIT ?
         """,
         [BATCH_SIZE],
