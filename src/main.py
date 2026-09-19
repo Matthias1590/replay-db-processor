@@ -18,7 +18,7 @@ load_dotenv()
 # Configuration
 # ---------------------------------------------------------------------------
 
-BATCH_SIZE = 3
+BATCH_SIZE = 10
 
 VRFKIT = Path(os.getenv("VRFKIT_PATH", "./vrfkit.exe"))
 
@@ -206,7 +206,7 @@ def process_replay(replay_path, output_dir: Path):
 # Database update
 # ---------------------------------------------------------------------------
 
-def save_batch(updates, players):
+def save_batch(updates, players, failures):
     statements = []
 
     for update in updates:
@@ -228,6 +228,16 @@ def save_batch(updates, players):
                 update["processed_at"],
                 update["replay_hash"],
             ],
+        })
+
+    for replay_hash in failures:
+        statements.append({
+            "sql": """
+                UPDATE replays
+                SET processing_status = 'failed'
+                WHERE verified_hash = ?
+            """,
+            "params": [replay_hash],
         })
 
     for player in players:
@@ -285,6 +295,7 @@ def main():
 
         updates = []
         players = []
+        failures = []
 
         with tempfile.TemporaryDirectory() as temp:
             temp = Path(temp)
@@ -336,18 +347,19 @@ def main():
                         f"FAILED {replay_hash}: {e}"
                     )
 
-                    # Leave it pending so the next run retries it.
+                    failures.append(replay_hash)
 
                 finally:
                     if replay_path.exists():
                         replay_path.unlink()
 
         print(
-            f"Writing {len(updates)} replay updates "
-            f"and {len(players)} players..."
+            f"Writing {len(updates)} completed, "
+            f"{len(failures)} failed, "
+            f"{len(players)} players..."
         )
 
-        save_batch(updates, players)
+        save_batch(updates, players, failures)
 
         print("Batch complete.")
 
