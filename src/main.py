@@ -82,15 +82,15 @@ def d1(query, params=None):
     return data["result"][0]
 
 
-def get_pending_replays():
+def get_unprocessed_replays(pending_only: bool):
+    statuses = "('pending')" if pending_only else "('pending', 'failed')"
+
     result = d1(
-        """
+        f"""
         SELECT verified_hash, storage_key
         FROM replays
-        WHERE processing_status = 'pending'
-        LIMIT ?
+        WHERE processing_status IN {statuses}
         """,
-        [BATCH_SIZE],
     )
 
     return result.get("results", [])
@@ -287,15 +287,21 @@ def save_batch(updates, players, failures):
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    while True:
-        replays = get_pending_replays()
+import sys
 
-        if not replays:
+def main():
+    replays = get_unprocessed_replays("--pending-only" in sys.argv)
+    num_total = len(replays)
+    num_processed = 0
+
+    while True:
+        batch, replays = replays[:BATCH_SIZE], replays[BATCH_SIZE:]
+
+        if not batch:
             print("No pending replays.")
             return
 
-        print(f"Processing {len(replays)} replays...")
+        print(f"Processing {len(batch)} replays...")
 
         updates = []
         players = []
@@ -304,12 +310,12 @@ def main():
         with tempfile.TemporaryDirectory() as temp:
             temp = Path(temp)
 
-            for i, replay in enumerate(replays, 1):
+            for replay in batch:
                 replay_hash = replay["verified_hash"]
                 storage_key = replay["storage_key"]
 
                 print(
-                    f"[{i}/{len(replays)}] "
+                    f"[{num_processed}/{num_total}] "
                     f"{replay_hash}"
                 )
 
@@ -360,6 +366,7 @@ def main():
                     })
 
                 finally:
+                    num_processed += 1
                     if replay_path.exists():
                         replay_path.unlink()
 
