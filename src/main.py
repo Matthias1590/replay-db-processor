@@ -9,6 +9,7 @@ from pathlib import Path
 import boto3
 import requests
 from dotenv import load_dotenv
+from replay_header import read_replay_game_version
 
 
 load_dotenv()
@@ -148,7 +149,6 @@ def process_replay(replay_path, output_dir: Path):
     metadata = {
         "map": extract_map_name(manifest["level_names_and_times"][0]["name"]),
         "duration_ms": manifest["duration_ms"],
-        "game_version": manifest["replay_build"]
     }
 
     min_player_id = float("inf")
@@ -229,14 +229,19 @@ def save_batch(updates, players, failures):
             ],
         })
 
-    for replay_hash in failures:
+    for failure in failures:
         statements.append({
             "sql": """
                 UPDATE replays
-                SET processing_status = 'failed'
+                SET
+                    game_version = COALESCE(?, game_version),
+                    processing_status = 'failed'
                 WHERE verified_hash = ?
             """,
-            "params": [replay_hash],
+            "params": [
+                failure["game_version"],
+                failure["replay_hash"],
+            ],
         })
 
     for player in players:
@@ -315,12 +320,15 @@ def main():
                     shutil.rmtree(output_dir)
 
                 output_dir.mkdir()
+                game_version = None
 
                 try:
                     download_replay(
                         storage_key,
                         replay_path,
                     )
+
+                    game_version = read_replay_game_version(replay_path)
 
                     metadata, replay_players = process_replay(
                         replay_path,
@@ -330,7 +338,7 @@ def main():
                     updates.append({
                         "replay_hash": replay_hash,
                         "map": metadata["map"],
-                        "game_version": metadata["game_version"],
+                        "game_version": game_version,
                         "duration_ms": metadata["duration_ms"],
                         "processed_at": int(__import__("time").time()),
                     })
@@ -346,7 +354,10 @@ def main():
                         f"FAILED {replay_hash}: {e}"
                     )
 
-                    failures.append(replay_hash)
+                    failures.append({
+                        "replay_hash": replay_hash,
+                        "game_version": game_version,
+                    })
 
                 finally:
                     if replay_path.exists():
